@@ -1759,7 +1759,11 @@ class ImarisLoader(FormatLoader):
                     chunks = data.chunks if data.chunks else "auto"
                     ch_arrays.append(da.from_array(data, chunks=chunks))
                 frames.append(da.stack(ch_arrays, axis=0))
-            return da.stack(frames, axis=0)
+            result = da.stack(frames, axis=0)
+            # Squeeze singleton T dim → CZYX so axes match array ndim
+            if len(time_points) == 1:
+                result = result[0]
+            return result
 
     @staticmethod
     def get_metadata(filepath: str, series_index: int) -> Dict:
