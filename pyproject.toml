@@ -59,8 +59,15 @@ testing = [
 clustering = [
     "scikit-learn-extra>=0.3.0",
 ]
+bioio = [
+    "bioio>=1.0.0",
+    "bioio-bioformats>=1.0.0",
+]
+imaris = [
+    "h5py>=3.0.0",
+]
 all = [
-    "napari-tmidas[testing,clustering]",
+    "napari-tmidas[testing,clustering,bioio,imaris]",
 ]
 
 [project.entry-points."napari.manifest"]
