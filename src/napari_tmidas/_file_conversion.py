@@ -56,6 +56,18 @@ try:
 except ImportError:
     TiffSlide = None  # Will fall back to tifffile in TIFFSlideLoader
 
+try:
+    from bioio import BioImage
+    import bioio_bioformats
+except ImportError:
+    BioImage = None
+    bioio_bioformats = None
+
+try:
+    import h5py
+except ImportError:
+    h5py = None
+
 
 def _is_conversion_debug_enabled() -> bool:
     """Enable verbose conversion diagnostics only when requested."""
@@ -1710,6 +1722,154 @@ class AcquiferLoader(FormatLoader):
             return {}
 
 
+class ImarisLoader(FormatLoader):
+    """H5py-backed loader for Imaris .ims files."""
+
+    @staticmethod
+    def can_load(filepath: str) -> bool:
+        if h5py is None:
+            return False
+        if not filepath.lower().endswith(".ims"):
+            return False
+        try:
+            with h5py.File(filepath, "r") as f:
+                return "DataSet" in f
+        except (OSError, Exception):
+            return False
+
+    @staticmethod
+    def get_series_count(filepath: str) -> int:
+        return 1
+
+    @staticmethod
+    def load_series(
+        filepath: str, series_index: int
+    ) -> da.Array:
+        if h5py is None:
+            raise FileFormatError("h5py not available")
+        with h5py.File(filepath, "r") as f:
+            ds = f["DataSet"]["ResolutionLevel 0"]
+            time_points = sorted(ds.keys())
+            channels = sorted(ds[time_points[0]].keys())
+            frames = []
+            for tp in time_points:
+                ch_arrays = []
+                for ch in channels:
+                    data = ds[tp][ch]["Data"]
+                    chunks = data.chunks if data.chunks else "auto"
+                    ch_arrays.append(da.from_array(data, chunks=chunks))
+                frames.append(da.stack(ch_arrays, axis=0))
+            return da.stack(frames, axis=0)
+
+    @staticmethod
+    def get_metadata(filepath: str, series_index: int) -> Dict:
+        if h5py is None:
+            return {}
+        try:
+            with h5py.File(filepath, "r") as f:
+                info = f.get("DataSetInfo", {}).get("Image", {})
+
+                def _read_attr(key) -> Optional[float]:
+                    val = info.attrs.get(key)
+                    if val is None:
+                        return None
+                    if isinstance(val, (bytes, np.bytes_)):
+                        val = val.decode()
+                    try:
+                        return float(val)
+                    except (ValueError, TypeError):
+                        return None
+
+                ext_max_x = _read_attr("ExtMax0")
+                ext_max_y = _read_attr("ExtMax1")
+                ext_max_z = _read_attr("ExtMax2")
+                ext_min_x = _read_attr("ExtMin0")
+                ext_min_y = _read_attr("ExtMin1")
+                ext_min_z = _read_attr("ExtMin2")
+
+                ds = f["DataSet"]["ResolutionLevel 0"]
+                tp0 = sorted(ds.keys())[0]
+                ch0 = sorted(ds[tp0].keys())[0]
+                shape = ds[tp0][ch0]["Data"].shape  # ZYX
+
+                resolution = None
+                if all(
+                    v is not None
+                    for v in [ext_max_x, ext_min_x, ext_max_y, ext_min_y]
+                ):
+                    nx = shape[2] if len(shape) >= 3 else 1
+                    ny = shape[1] if len(shape) >= 2 else 1
+                    px_x = (ext_max_x - ext_min_x) / nx if nx > 0 else 0
+                    px_y = (ext_max_y - ext_min_y) / ny if ny > 0 else 0
+                    if px_x > 0 and px_y > 0:
+                        resolution = (1.0 / px_x, 1.0 / px_y)
+
+                spacing = None
+                if all(v is not None for v in [ext_max_z, ext_min_z]):
+                    nz = shape[0] if shape else 1
+                    if nz > 1:
+                        spacing = (ext_max_z - ext_min_z) / nz
+
+                n_timepoints = len(ds.keys())
+                axes = "TCZYX" if n_timepoints > 1 else "CZYX"
+
+                return {
+                    "axes": axes,
+                    "resolution": resolution,
+                    "spacing": spacing,
+                    "unit": "um",
+                }
+        except (OSError, KeyError, AttributeError, ValueError):
+            return {}
+
+
+class BioIOLoader(FormatLoader):
+    """Generic BioIO-backed fallback loader for any bioformats-compatible file."""
+
+    @staticmethod
+    def can_load(filepath: str) -> bool:
+        return BioImage is not None
+
+    @staticmethod
+    def get_series_count(filepath: str) -> int:
+        try:
+            reader = bioio_bioformats.Reader if bioio_bioformats else None
+            img = BioImage(filepath, reader=reader)
+            return len(img.scenes)
+        except Exception:
+            return 0
+
+    @staticmethod
+    def load_series(
+        filepath: str, series_index: int
+    ) -> da.Array:
+        reader = bioio_bioformats.Reader if bioio_bioformats else None
+        img = BioImage(filepath, reader=reader)
+        img.set_scene(series_index)
+        return img.dask_data
+
+    @staticmethod
+    def get_metadata(filepath: str, series_index: int) -> Dict:
+        try:
+            reader = bioio_bioformats.Reader if bioio_bioformats else None
+            img = BioImage(filepath, reader=reader)
+            img.set_scene(series_index)
+            pps = img.physical_pixel_sizes
+            resolution = None
+            if pps.X and pps.Y:
+                resolution = (1.0 / pps.X, 1.0 / pps.Y)
+            spacing = pps.Z if pps.Z else None
+            return {
+                "axes": img.dims.order,
+                "resolution": resolution,
+                "spacing": spacing,
+                "channel_names": img.channel_names,
+                "unit": "um",
+            }
+        except Exception:
+            return {}
+
+
 class ScanFolderWorker(QThread):
     """Worker thread for scanning folders"""
 
@@ -1869,6 +2029,31 @@ class ConversionWorker(QThread):
             print(f"Conversion report written to: {report_path}")
 
         self.finished.emit(success_count)
+
+    def _chunk_nbytes(self, chunksize: tuple, dtype) -> int:
+        return int(np.prod(chunksize)) * np.dtype(dtype).itemsize
+
+    def _rechunk_for_zarr(
+        self,
+        image_data: da.Array,
+        axes: str,
+        max_chunk_bytes: int = 1_500_000_000,
+    ) -> da.Array:
+        chunk_bytes = self._chunk_nbytes(image_data.chunksize, image_data.dtype)
+        if chunk_bytes <= max_chunk_bytes:
+            return image_data
+
+        new_chunks = list(image_data.chunksize)
+        for i in range(len(new_chunks)):
+            chunk_bytes = self._chunk_nbytes(tuple(new_chunks), image_data.dtype)
+            if chunk_bytes <= max_chunk_bytes:
+                break
+            if new_chunks[i] <= 1:
+                continue
+            ratio = max_chunk_bytes / chunk_bytes
+            new_chunks[i] = max(1, int(new_chunks[i] * ratio))
+
+        return image_data.rechunk(tuple(new_chunks))
 
     def _should_skip_file(self, filepath: str, error_message: str) -> bool:
         """Return True for known read errors that should be skipped."""
@@ -2379,6 +2564,8 @@ class MicroscopyImageConverterWidget(QWidget):
             TIFFSlideLoader,
             CZILoader,
             AcquiferLoader,
+            ImarisLoader,
+            BioIOLoader,
         ]
 
         # Conversion state
@@ -2411,9 +2598,9 @@ class MicroscopyImageConverterWidget(QWidget):
         filter_layout.addWidget(QLabel("File Filter:"))
         self.filter_edit = QLineEdit()
         self.filter_edit.setPlaceholderText(
-            ".lif, .nd2, .ndpi, .czi, acquifer"
+            ".lif, .nd2, .ndpi, .czi, .ims, acquifer"
         )
-        self.filter_edit.setText(".lif,.nd2,.ndpi,.czi,acquifer")
+        self.filter_edit.setText(".lif,.nd2,.ndpi,.czi,.ims,acquifer")
         scan_button = QPushButton("Scan Folder")
         scan_button.clicked.connect(self.scan_folder)
 
@@ -2666,6 +2853,8 @@ class MicroscopyImageConverterWidget(QWidget):
             return "Slide"
         elif ext.endswith(".czi"):
             return "CZI"
+        elif ext.endswith(".ims"):
+            return "IMS"
         return "Unknown"
 
     def get_file_loader(self, filepath: str) -> Optional[FormatLoader]:
