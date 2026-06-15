@@ -2371,7 +2371,7 @@ class ConversionWorker(QThread):
                     axes=axes or "zyx",
                     coordinate_transformations=base_coordinate_transform,
                     scaler=Scaler(max_layer=0),
-                    storage_options={"compression": "zstd"},
+                    storage_options={"compressors": "auto"},
                 )
 
             print(
