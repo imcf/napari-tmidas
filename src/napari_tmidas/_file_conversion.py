@@ -1777,10 +1777,18 @@ class ImarisLoader(FormatLoader):
                     val = info.attrs.get(key)
                     if val is None:
                         return None
+                    # h5py may wrap scalars in numpy arrays
+                    if isinstance(val, np.ndarray):
+                        if val.size == 0:
+                            return None
+                        val = val.flat[0]
+                    # bytes-like (np.bytes_, bytes, numpy void)
                     if isinstance(val, (bytes, np.bytes_)):
-                        val = val.decode()
+                        val = val.decode("utf-8", errors="replace").strip()
+                    elif hasattr(val, "decode"):
+                        val = val.decode("utf-8", errors="replace").strip()
                     try:
-                        return float(val)
+                        return float(str(val).strip())
                     except (ValueError, TypeError):
                         return None
 
@@ -1790,6 +1798,11 @@ class ImarisLoader(FormatLoader):
                 ext_min_x = _read_attr("ExtMin0")
                 ext_min_y = _read_attr("ExtMin1")
                 ext_min_z = _read_attr("ExtMin2")
+                _debug_print(
+                    f"ImarisLoader ExtMax: ({ext_max_x}, {ext_max_y}, {ext_max_z})"
+                    f" ExtMin: ({ext_min_x}, {ext_min_y}, {ext_min_z})"
+                    f" raw attrs: {dict(info.attrs)}"
+                )
 
                 ds = f["DataSet"]["ResolutionLevel 0"]
                 tp0 = sorted(ds.keys())[0]
