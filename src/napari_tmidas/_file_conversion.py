@@ -1747,7 +1747,11 @@ class ImarisLoader(FormatLoader):
     ) -> da.Array:
         if h5py is None:
             raise FileFormatError("h5py not available")
-        with h5py.File(filepath, "r") as f:
+        # Do NOT use a context manager: the returned dask array holds
+        # references to h5py Dataset objects, which keep the HDF5 file
+        # open until the array is garbage-collected after conversion.
+        f = h5py.File(filepath, "r")
+        try:
             ds = f["DataSet"]["ResolutionLevel 0"]
             time_points = sorted(ds.keys())
             channels = sorted(ds[time_points[0]].keys())
@@ -1764,6 +1768,9 @@ class ImarisLoader(FormatLoader):
             if len(time_points) == 1:
                 result = result[0]
             return result
+        except Exception:
+            f.close()
+            raise
 
     @staticmethod
     def get_metadata(filepath: str, series_index: int) -> Dict:
