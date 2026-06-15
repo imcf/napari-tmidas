@@ -43,6 +43,7 @@ from qtpy.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -1986,12 +1987,16 @@ class ConversionWorker(QThread):
         output_folder: str,
         use_zarr: bool,
         file_loader_func,
+        use_pyramid: bool = False,
+        max_pyramid_levels: int = 5,
     ):
         super().__init__()
         self.files_to_convert = files_to_convert
         self.output_folder = output_folder
         self.use_zarr = use_zarr
         self.get_file_loader = file_loader_func
+        self.use_pyramid = use_pyramid
+        self.max_pyramid_levels = max_pyramid_levels
         self.running = True
 
     def run(self):
@@ -2104,6 +2109,24 @@ class ConversionWorker(QThread):
             new_chunks[i] = max(1, int(new_chunks[i] * ratio))
 
         return image_data.rechunk(tuple(new_chunks))
+
+    def _compute_pyramid_levels(self, shape: tuple, axes: str) -> int:
+        """Return number of additional pyramid levels (beyond full-res) for XY dims."""
+        axes_lower = axes.lower()
+        xy_sizes = [
+            shape[i]
+            for i, ax in enumerate(axes_lower)
+            if ax in ("x", "y")
+        ]
+        if not xy_sizes:
+            return 0
+        max_xy = max(xy_sizes)
+        n = 0
+        size = max_xy
+        while size > 512 and n < self.max_pyramid_levels:
+            size //= 2
+            n += 1
+        return n
 
     def _should_skip_file(self, filepath: str, error_message: str) -> bool:
         """Return True for known read errors that should be skipped."""
@@ -2397,11 +2420,32 @@ class ConversionWorker(QThread):
             scale_transform = self._build_scale_transform(
                 metadata, axes, image_data.shape
             )
-            # Downstream segmentation workflows use full-resolution data only,
-            # so write a single-level OME-Zarr (no multiscale pyramid).
-            base_coordinate_transform = (
-                [[scale_transform]] if scale_transform else None
-            )
+
+            if self.use_pyramid:
+                n_levels = self._compute_pyramid_levels(
+                    image_data.shape, axes
+                )
+                scaler = Scaler(max_layer=n_levels)
+                pyramid_factors = tuple(
+                    2**i for i in range(1, n_levels + 1)
+                )
+                coord_transforms = (
+                    self._build_pyramid_coordinate_transformations(
+                        scale_transform, axes, pyramid_factors
+                    )
+                    if scale_transform
+                    else None
+                )
+                print(
+                    f"Generating {n_levels} pyramid level(s) "
+                    f"(2x XY per step) on top of full resolution"
+                )
+            else:
+                n_levels = 0
+                scaler = Scaler(max_layer=0)
+                coord_transforms = (
+                    [[scale_transform]] if scale_transform else None
+                )
 
             # Save with OME-ZARR including physical metadata
             with ProgressBar():
@@ -2410,13 +2454,12 @@ class ConversionWorker(QThread):
                 # Set layer name for napari compatibility
                 root.attrs["name"] = layer_name
 
-                # Write a single-level OME-Zarr with physical metadata.
                 write_image(
                     image_data,
                     group=root,
                     axes=axes or "zyx",
-                    coordinate_transformations=base_coordinate_transform,
-                    scaler=Scaler(max_layer=0),
+                    coordinate_transformations=coord_transforms,
+                    scaler=scaler,
                     storage_options={"compressors": "auto"},
                 )
 
@@ -2684,6 +2727,27 @@ class MicroscopyImageConverterWidget(QWidget):
         format_layout.addWidget(self.tif_radio)
         format_layout.addWidget(self.zarr_radio)
         main_layout.addLayout(format_layout)
+
+        # Pyramid options (OME-Zarr only)
+        pyramid_layout = QHBoxLayout()
+        self.pyramid_checkbox = QCheckBox(
+            "Generate OME-Zarr pyramid (multiscale)"
+        )
+        self.pyramid_checkbox.setChecked(False)
+        self.pyramid_checkbox.setToolTip(
+            "Build downsampled pyramid levels (2x XY per step) for fast "
+            "multi-resolution browsing. Recommended for images > 2048 px."
+        )
+        pyramid_layout.addWidget(self.pyramid_checkbox)
+        pyramid_layout.addWidget(QLabel("Max levels:"))
+        self.pyramid_levels_spin = QSpinBox()
+        self.pyramid_levels_spin.setMinimum(1)
+        self.pyramid_levels_spin.setMaximum(8)
+        self.pyramid_levels_spin.setValue(5)
+        self.pyramid_levels_spin.setFixedWidth(50)
+        pyramid_layout.addWidget(self.pyramid_levels_spin)
+        pyramid_layout.addStretch()
+        main_layout.addLayout(pyramid_layout)
 
         # Output folder
         output_layout = QHBoxLayout()
@@ -3049,6 +3113,8 @@ class MicroscopyImageConverterWidget(QWidget):
             output_folder=output_folder,
             use_zarr=self.zarr_radio.isChecked(),
             file_loader_func=self.get_file_loader,
+            use_pyramid=self.pyramid_checkbox.isChecked(),
+            max_pyramid_levels=self.pyramid_levels_spin.value(),
         )
 
         self.conversion_worker.progress.connect(
