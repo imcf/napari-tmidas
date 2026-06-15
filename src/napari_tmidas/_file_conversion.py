@@ -1773,22 +1773,43 @@ class ImarisLoader(FormatLoader):
             with h5py.File(filepath, "r") as f:
                 info = f.get("DataSetInfo", {}).get("Image", {})
 
-                def _read_attr(key) -> Optional[float]:
+                def _read_attr_str(key) -> Optional[str]:
+                    """Read an HDF5 attribute stored as scalar or char array."""
                     val = info.attrs.get(key)
                     if val is None:
                         return None
-                    # h5py may wrap scalars in numpy arrays
                     if isinstance(val, np.ndarray):
                         if val.size == 0:
                             return None
+                        # Imaris stores strings as S1 char arrays — join them
+                        if val.dtype.kind in ("S", "U"):
+                            joined = b"".join(
+                                v if isinstance(v, bytes) else v.encode()
+                                for v in val.flat
+                            )
+                            return joined.decode("utf-8", errors="replace").strip()
                         val = val.flat[0]
-                    # bytes-like (np.bytes_, bytes, numpy void)
                     if isinstance(val, (bytes, np.bytes_)):
-                        val = val.decode("utf-8", errors="replace").strip()
-                    elif hasattr(val, "decode"):
-                        val = val.decode("utf-8", errors="replace").strip()
+                        return val.decode("utf-8", errors="replace").strip()
+                    if hasattr(val, "decode"):
+                        return val.decode("utf-8", errors="replace").strip()
+                    return str(val).strip()
+
+                def _read_attr(key) -> Optional[float]:
+                    s = _read_attr_str(key)
+                    if s is None:
+                        return None
                     try:
-                        return float(str(val).strip())
+                        return float(s)
+                    except (ValueError, TypeError):
+                        return None
+
+                def _read_attr_int(key) -> Optional[int]:
+                    s = _read_attr_str(key)
+                    if s is None:
+                        return None
+                    try:
+                        return int(s)
                     except (ValueError, TypeError):
                         return None
 
@@ -1798,24 +1819,29 @@ class ImarisLoader(FormatLoader):
                 ext_min_x = _read_attr("ExtMin0")
                 ext_min_y = _read_attr("ExtMin1")
                 ext_min_z = _read_attr("ExtMin2")
+                # Use pixel counts from metadata attrs — Data array may be
+                # chunk-padded and larger than the true image dimensions
+                nx_meta = _read_attr_int("X")
+                ny_meta = _read_attr_int("Y")
+                nz_meta = _read_attr_int("Z")
                 _debug_print(
                     f"ImarisLoader ExtMax: ({ext_max_x}, {ext_max_y}, {ext_max_z})"
                     f" ExtMin: ({ext_min_x}, {ext_min_y}, {ext_min_z})"
-                    f" raw attrs: {dict(info.attrs)}"
+                    f" dims from attrs: X={nx_meta} Y={ny_meta} Z={nz_meta}"
                 )
 
                 ds = f["DataSet"]["ResolutionLevel 0"]
                 tp0 = sorted(ds.keys())[0]
                 ch0 = sorted(ds[tp0].keys())[0]
-                shape = ds[tp0][ch0]["Data"].shape  # ZYX
+                shape = ds[tp0][ch0]["Data"].shape  # ZYX (may be padded)
 
                 resolution = None
                 if all(
                     v is not None
                     for v in [ext_max_x, ext_min_x, ext_max_y, ext_min_y]
                 ):
-                    nx = shape[2] if len(shape) >= 3 else 1
-                    ny = shape[1] if len(shape) >= 2 else 1
+                    nx = nx_meta if nx_meta else (shape[2] if len(shape) >= 3 else 1)
+                    ny = ny_meta if ny_meta else (shape[1] if len(shape) >= 2 else 1)
                     px_x = (ext_max_x - ext_min_x) / nx if nx > 0 else 0
                     px_y = (ext_max_y - ext_min_y) / ny if ny > 0 else 0
                     if px_x > 0 and px_y > 0:
@@ -1823,7 +1849,7 @@ class ImarisLoader(FormatLoader):
 
                 spacing = None
                 if all(v is not None for v in [ext_max_z, ext_min_z]):
-                    nz = shape[0] if shape else 1
+                    nz = nz_meta if nz_meta else (shape[0] if shape else 1)
                     if nz > 1:
                         spacing = (ext_max_z - ext_min_z) / nz
 
